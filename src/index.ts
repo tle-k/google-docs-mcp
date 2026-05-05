@@ -117,80 +117,27 @@ const GOOGLE_API_SCOPES = [
   'https://www.googleapis.com/auth/calendar.events',
 ];
 
-const oauthProxy = isRemote
-  ? new OAuthProxy({
-      upstreamAuthorizationEndpoint: 'https://accounts.google.com/o/oauth2/v2/auth',
-      upstreamTokenEndpoint: 'https://oauth2.googleapis.com/token',
-      upstreamClientId: process.env.GOOGLE_CLIENT_ID!,
-      upstreamClientSecret: process.env.GOOGLE_CLIENT_SECRET!,
-      baseUrl: process.env.BASE_URL!,
-      scopes: GOOGLE_API_SCOPES,
-      allowedRedirectUriPatterns: [
-        'http://localhost:*',
-        `${process.env.BASE_URL}/*`,
-        'cursor://*',
-        'https://claude.ai/*',
-        'https://claude.com/*',
-        'claude://*',
-      ],
-      jwtSigningKey: process.env.JWT_SIGNING_KEY,
-      encryptionKey: process.env.TOKEN_ENCRYPTION_KEY,
-      consentRequired: false,
-      accessTokenTtl: 2592000,
-      refreshTokenTtl: 2592000,
-      ...(process.env.TOKEN_STORE === 'firestore' && {
-        tokenStorage: new FirestoreTokenStorage(process.env.GCLOUD_PROJECT),
-      }),
-    })
-  : undefined;
-
-if (oauthProxy) {
-  // issueSwappedTokens() inlines the TTL logic: it checks
-  // upstreamTokens.expiresIn > 0 BEFORE config.accessTokenTtl.
-  // Google always returns expiresIn=3600, so our 30-day config is
-  // never reached. Zero it out so the config fallback is used.
-  const origIssue = (oauthProxy as any).issueSwappedTokens.bind(oauthProxy);
-  (oauthProxy as any).issueSwappedTokens = async function (clientId: string, upstreamTokens: any) {
-    if (this.config.accessTokenTtl) {
-      return origIssue(clientId, { ...upstreamTokens, expiresIn: 0 });
-    }
-    return origIssue(clientId, upstreamTokens);
-  };
+// --- 1. Service Account Sandbox Setup ---
+const fs = await import('fs');
+if (process.env.GOOGLE_SERVICE_ACCOUNT_JSON) {
+  // Write the JSON to a temporary file that Google's SDK automatically detects
+  fs.writeFileSync('/tmp/service-account.json', process.env.GOOGLE_SERVICE_ACCOUNT_JSON);
+  process.env.GOOGLE_APPLICATION_CREDENTIALS = '/tmp/service-account.json';
 }
 
+// --- 2. Initialize Server with URL Bouncer ---
 const server = new FastMCP({
   name: 'Ultimate Google Docs & Sheets MCP Server',
   version: '1.0.0',
-  ...(isRemote &&
-    oauthProxy && {
-      authenticate: async (request: any) => {
-        if (!request) return undefined;
-        const authHeader = request.headers?.authorization;
-        if (!authHeader?.startsWith('Bearer ')) return undefined;
-        const token = authHeader.slice(7);
-        const upstreamTokens = await oauthProxy.loadUpstreamTokens(token);
-        if (!upstreamTokens) return undefined;
-        return {
-          accessToken: upstreamTokens.accessToken,
-          refreshToken: upstreamTokens.refreshToken,
-          expiresAt: upstreamTokens.expiresIn
-            ? Math.floor(Date.now() / 1000) + upstreamTokens.expiresIn
-            : undefined,
-          idToken: upstreamTokens.idToken,
-          scopes: upstreamTokens.scope,
-        };
-      },
-      oauth: {
-        enabled: true,
-        authorizationServer: oauthProxy.getAuthorizationServerMetadata(),
-        protectedResource: {
-          authorizationServers: [process.env.BASE_URL!],
-          resource: process.env.BASE_URL!,
-          scopesSupported: GOOGLE_API_SCOPES,
-        },
-        proxy: oauthProxy,
-      },
-    }),
+  authenticate: async (request: any) => {
+    // Check the URL for the ?key= parameter
+    const url = new URL(request.url || '', `http://${request.headers?.host || 'localhost'}`);
+    if (url.searchParams.get('key') !== process.env.MCP_SECRET_KEY) {
+       throw new Error('Unauthorized access blocked by bouncer.');
+    }
+    // If the key matches, let Claude in
+    return { identity: 'claude-trading-bot' };
+  }
 });
 
 const registeredTools: Parameters<FastMCP['addTool']>[0][] = [];
@@ -200,7 +147,8 @@ registerAllTools(server);
 
 try {
   if (isRemote) {
-    logger.info('Starting in remote mode (httpStream + MCP OAuth 2.1)...');
+    await initializeGoogleClient();
+    logger.info('Starting in remote mode (Service Account + API Key Bouncer)...');
     registerLandingPage(server, registeredTools.length);
     registerDownloadRoute(server);
 
