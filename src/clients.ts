@@ -12,7 +12,6 @@ export async function initializeGoogleClient() {
   
   if (process.env.GOOGLE_SERVICE_ACCOUNT_JSON) {
     try {
-      // Parse the JSON variable natively in memory
       const credentials = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON);
       auth = new google.auth.GoogleAuth({
         credentials,
@@ -30,7 +29,6 @@ export async function initializeGoogleClient() {
       throw e;
     }
   } else {
-    // Native fallback for local desktop usage
     const { getOAuthClient } = await import('./auth.js');
     auth = await getOAuthClient();
     logger.info("Authenticated using local OAuth token.");
